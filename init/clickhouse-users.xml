@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!--
+  Demo-only override.
+
+  The clickhouse-server image ships a default-user.xml that restricts the
+  `default` user to ::1 / 127.0.0.1, so clients connecting through Docker's
+  port-forward (a non-loopback source IP) are rejected with code 516.
+
+  This file is mounted into /etc/clickhouse-server/users.d with a name that
+  sorts AFTER default-user.xml, so it is merged last and adds ::/0 to the
+  allowed networks for `default`. Do NOT do this in production — it opens the
+  passwordless default user to every network.
+-->
+<clickhouse>
+  <users>
+    <default>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>

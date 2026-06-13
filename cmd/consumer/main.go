@@ -35,6 +35,8 @@ type config struct {
 	group          string
 	clickhouseAddr string
 	clickhouseDB   string
+	clickhouseUser string
+	clickhousePass string
 	batchSize      int
 	flushInterval  time.Duration
 }
@@ -46,6 +48,8 @@ func loadConfig() config {
 		group:          env("CONSUMER_GROUP", "grcs-clickhouse"),
 		clickhouseAddr: env("CLICKHOUSE_ADDR", "127.0.0.1:9000"),
 		clickhouseDB:   env("CLICKHOUSE_DB", "grcs"),
+		clickhouseUser: env("CLICKHOUSE_USER", "default"),
+		clickhousePass: env("CLICKHOUSE_PASSWORD", ""),
 		batchSize:      envInt("BATCH_SIZE", 1000),
 		flushInterval:  time.Duration(envInt("FLUSH_MS", 1000)) * time.Millisecond,
 	}
@@ -103,7 +107,11 @@ func main() {
 func newClickHouse(cfg config) (driver.Conn, error) {
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: strings.Split(cfg.clickhouseAddr, ","),
-		Auth: clickhouse.Auth{Database: cfg.clickhouseDB},
+		Auth: clickhouse.Auth{
+			Database: cfg.clickhouseDB,
+			Username: cfg.clickhouseUser,
+			Password: cfg.clickhousePass,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -118,75 +126,74 @@ func newClickHouse(cfg config) (driver.Conn, error) {
 
 // run is the poll/batch/flush loop. It flushes when the batch reaches batchSize
 // or when flushInterval elapses with records buffered, whichever comes first.
+//
+// Each poll is bounded by flushInterval (via a per-poll timeout) so a quiet
+// topic can't leave a partial batch buffered: the poll returns empty when the
+// interval elapses and we flush whatever has accumulated.
 func run(ctx context.Context, client *kgo.Client, ch driver.Conn, cfg config) {
-	ticker := time.NewTicker(cfg.flushInterval)
-	defer ticker.Stop()
-
 	batch := make([]event.Event, 0, cfg.batchSize)
+	lastFlush := time.Now()
 
 	// flush writes the buffered events to ClickHouse, then commits offsets so
 	// those records are not redelivered. Order matters: insert first, commit
-	// second (at-least-once).
-	flush := func() {
+	// second (at-least-once). It uses flushCtx so the final flush can run with a
+	// fresh context after ctx is cancelled.
+	flush := func(flushCtx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		if err := insert(ctx, ch, cfg.clickhouseDB, batch); err != nil {
+		if err := insert(flushCtx, ch, cfg.clickhouseDB, batch); err != nil {
 			// Keep the batch (and uncommitted offsets) so the next flush retries
 			// these same events instead of dropping them.
 			log.Printf("clickhouse insert failed (%d events), will retry next flush: %v", len(batch), err)
 			return
 		}
-		if err := client.CommitUncommittedOffsets(ctx); err != nil {
+		if err := client.CommitUncommittedOffsets(flushCtx); err != nil {
 			log.Printf("offset commit failed: %v", err)
 		}
 		log.Printf("flushed %d events to clickhouse", len(batch))
 		batch = batch[:0]
+		lastFlush = time.Now()
 	}
 
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
+			// Shutdown: drain whatever is buffered with a fresh context.
 			log.Println("shutdown: flushing remaining events")
-			// Use a fresh context; ctx is already cancelled.
-			flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if len(batch) > 0 {
-				if err := insert(flushCtx, ch, cfg.clickhouseDB, batch); err != nil {
-					log.Printf("final flush failed: %v", err)
-				} else if err := client.CommitUncommittedOffsets(flushCtx); err != nil {
-					log.Printf("final commit failed: %v", err)
-				}
-			}
+			drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			flush(drainCtx)
 			cancel()
 			return
+		}
 
-		case <-ticker.C:
-			flush()
+		// Poll for at most flushInterval. The bounded context guarantees we come
+		// back to the flush check even when no records are arriving.
+		pollCtx, cancel := context.WithTimeout(ctx, cfg.flushInterval)
+		fetches := client.PollFetches(pollCtx)
+		cancel()
 
-		default:
-			fetches := client.PollFetches(ctx)
-			if errs := fetches.Errors(); len(errs) > 0 {
-				for _, e := range errs {
-					if errors.Is(e.Err, context.Canceled) {
-						continue
-					}
-					log.Printf("fetch error (topic=%s partition=%d): %v", e.Topic, e.Partition, e.Err)
-				}
+		for _, e := range fetches.Errors() {
+			// A poll that times out or is cancelled is expected, not an error.
+			if errors.Is(e.Err, context.DeadlineExceeded) || errors.Is(e.Err, context.Canceled) {
+				continue
 			}
+			log.Printf("fetch error (topic=%s partition=%d): %v", e.Topic, e.Partition, e.Err)
+		}
 
-			fetches.EachRecord(func(rec *kgo.Record) {
-				ev, err := event.Unmarshal(rec.Value)
-				if err != nil {
-					// Poison record: log and skip rather than stalling the group.
-					log.Printf("skipping malformed record at offset %d: %v", rec.Offset, err)
-					return
-				}
-				batch = append(batch, ev)
-			})
-
-			if len(batch) >= cfg.batchSize {
-				flush()
+		fetches.EachRecord(func(rec *kgo.Record) {
+			ev, err := event.Unmarshal(rec.Value)
+			if err != nil {
+				// Poison record: log and skip rather than stalling the group.
+				log.Printf("skipping malformed record at offset %d: %v", rec.Offset, err)
+				return
 			}
+			batch = append(batch, ev)
+		})
+
+		// Flush on a full batch, or once the interval has elapsed with anything
+		// buffered.
+		if len(batch) >= cfg.batchSize || (len(batch) > 0 && time.Since(lastFlush) >= cfg.flushInterval) {
+			flush(ctx)
 		}
 	}
 }
