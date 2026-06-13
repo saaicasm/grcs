@@ -14,7 +14,7 @@ CREATE KEYSPACE IF NOT EXISTS grcs
 
 -- events: one row per event, partitioned by user_id.
 --
--- Data modeling note (the interview point): Scylla/Cassandra is query-driven.
+-- Data modeling note: Scylla/Cassandra is query-driven.
 -- We partition by user_id and cluster by (timestamp DESC, id) so the natural
 -- query — "give me the most recent events for a user" — is a single-partition
 -- read served in timestamp order, no filtering or secondary index needed.
