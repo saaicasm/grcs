@@ -1,0 +1,84 @@
+# Three backing services for the grcs pipeline.
+#
+#   POST /events ──┬── ScyllaDB        (operational store)
+#                  └── Redpanda ──► consumer ──► ClickHouse (analytics)
+#
+# The init scripts under ./init are mounted into each container but NOT run
+# automatically — apply them once after the services are healthy:
+#
+#   docker compose up -d
+#   docker compose exec -T scylla     cqlsh        < init/scylla.cql
+#   docker compose exec -T clickhouse clickhouse-client --multiquery < init/clickhouse.sql
+
+services:
+  # ── Operational store: fast key-based reads/writes on the API write path ──
+  scylla:
+    image: scylladb/scylla:6.0
+    container_name: grcs-scylla
+    # --smp 1 / --memory keep it light for a  demo; not for production.
+    command: --smp 1 --memory 1G --overprovisioned 1 --developer-mode 1
+    ports:
+      - "9042:9042" # CQL native protocol (gocql connects here)
+    volumes:
+      - scylla-data:/var/lib/scylla
+      - ./init/scylla.cql:/init/scylla.cql:ro
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe cluster"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Redpanda: Kafka-compatible log decoupling writes from analytics ──
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: grcs-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      # Advertise localhost so the Go api/consumer on the host can reach it.
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:9092
+    ports:
+      - "9092:9092"  # Kafka API (franz-go connects here)
+      - "9644:9644"  # Admin/metrics
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # ── ClickHouse: columnar analytics store (consumer batch-inserts here) ──
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: grcs-clickhouse
+    ports:
+      - "8123:8123" # HTTP interface
+      - "9000:9000" # Native protocol (clickhouse-go connects here)
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./init/clickhouse.sql:/init/clickhouse.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+volumes:
+  scylla-data:
+  redpanda-data:
+  clickhouse-data:
