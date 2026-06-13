@@ -1,1 +1,57 @@
+# Project-local instructions (kept out of the repo intentionally)
 CLAUDE.md
+
+# ── Go ──────────────────────────────────────────────────────────────────
+# Compiled binaries / build output
+/api
+/consumer
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test           # test binaries from `go test -c`
+*.out            # profiling / coverage output
+coverage.*
+# Go workspace file (machine-local)
+go.work
+go.work.sum
+# Vendored deps (we rely on the module cache instead)
+/vendor/
+
+# NOTE: go.mod and go.sum ARE committed — do not ignore them.
+
+# ── Docker / service data ───────────────────────────────────────────────
+# The compose file uses named volumes (scylla-data, redpanda-data,
+# clickhouse-data) which live in Docker's own storage, not the repo. These
+# patterns catch any local bind-mount data dirs if someone switches to them.
+/data/
+/scylla-data/
+/redpanda-data/
+/clickhouse-data/
+
+# Scylla operational artifacts (if ever bind-mounted)
+*.db
+commitlog/
+*.cql.log
+
+# Redpanda local data / logs (if ever bind-mounted)
+redpanda/
+*.kafka
+
+# ClickHouse local data / logs (if ever bind-mounted)
+clickhouse/
+*.clickhouse.log
+
+# ── Env / secrets ───────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Editor / OS cruft ───────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
